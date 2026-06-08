@@ -27,6 +27,7 @@ A Model Context Protocol (MCP) server that provides tools for querying Azure ret
 | `azure_cost_estimate` | Estimate costs based on usage | Calculate monthly costs for 8hr/day usage |
 | `azure_discover_skus` | Discover available SKUs for a service | Find all VM types for a service |
 | `azure_sku_discovery` | Intelligent SKU discovery with fuzzy matching | "Find app service plans" or "web app pricing" |
+| `azure_price_architecture` | Price a whole architecture/app as one monthly bill | Estimate monthly cost of a multi-service application |
 
 ## 📋 Installation
 
@@ -79,6 +80,7 @@ Once configured with Claude, you can ask:
 - **GPU Pricing**: "Show me all GPU-enabled VMs with pricing"
 - **Service Discovery**: "Find all App Service plan pricing" or "What storage options are available?"
 - **SKU Discovery**: "Show me all web app hosting plans"
+- **Architecture Pricing**: "Estimate the monthly bill for a D2s_v3 VM plus 500 GB of Hot LRS blob storage"
 
 ## 🧪 Testing
 
@@ -117,6 +119,25 @@ This server uses the official Azure Retail Prices API:
 - Reserved instance pricing comparisons
 - Multi-region cost analysis
 - Intelligent SKU discovery for finding the best pricing options
+
+### Architecture / Application Pricing
+The `azure_price_architecture` tool turns a list of line items into a single
+monthly bill, designed to be driven by an agent pricing a whole application:
+
+- **Deterministic math** – subtotals (`unit_price × quantity ÷ unit_multiplier`)
+  and monthly/yearly totals are computed in code, not by the model, so the
+  arithmetic is reliable across many line items.
+- **Unit-aware** – the per-unit block in `unitOfMeasure` (e.g. `"100 Hours"`,
+  `"10K"`) is parsed so storage, bandwidth, and per-hour meters all price
+  correctly. `quantity` is given in the meter's base unit (hours, GB, etc.).
+- **Tier-aware** – graduated meters select the tier applicable to the quantity.
+- **Never guesses** – line items matching multiple distinct meters are returned
+  as `ambiguous` with candidate meters (and excluded from the total); resolve
+  them with `meter_name`, `product_name`, or `unit`. Use `arm_sku_name` to match
+  resources by their ARM name (e.g. `Standard_D2s_v3`).
+
+The agent owns architecture interpretation, SKU selection, and usage
+assumptions; the MCP owns accurate price lookup and the math.
 
 ### Developer Friendly
 - Comprehensive error handling

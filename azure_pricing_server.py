@@ -34,6 +34,51 @@ logger = logging.getLogger(__name__)
 AZURE_PRICING_BASE_URL = "https://prices.azure.com/api/retail/prices"
 DEFAULT_API_VERSION = "2023-01-01-preview"
 MAX_RESULTS_PER_REQUEST = 1000
+MAX_PAGES = 20
+
+
+def _escape_odata_literal(value: str) -> str:
+    """Escape a string for safe use inside an OData string literal.
+
+    In OData, a single quote within a string literal is escaped by doubling it.
+    This prevents user-supplied filter values from breaking out of the quoted
+    literal and altering the query (OData injection).
+    """
+    return str(value).replace("'", "''")
+
+
+def _parse_unit_multiplier(unit_of_measure: Optional[str]) -> float:
+    """Extract the leading quantity multiplier from an Azure unitOfMeasure.
+
+    Azure prices are quoted per a block of units, e.g. ``"1 Hour"``,
+    ``"100 Hours"``, ``"1 GB/Month"``, ``"10K"``. The retailPrice is the price
+    for that whole block, so to price an arbitrary quantity we must divide by
+    the leading multiplier. Returns ``1.0`` when no multiplier can be parsed.
+
+    Examples:
+        "1 Hour"      -> 1.0
+        "100 Hours"   -> 100.0
+        "10K"         -> 10000.0
+        "1 GB/Month"  -> 1.0
+    """
+    if not unit_of_measure:
+        return 1.0
+    token = str(unit_of_measure).strip().split()[0] if str(unit_of_measure).strip() else ""
+    if not token:
+        return 1.0
+    suffix_multipliers = {"k": 1_000.0, "m": 1_000_000.0, "b": 1_000_000_000.0}
+    multiplier = 1.0
+    last = token[-1].lower()
+    if last in suffix_multipliers:
+        multiplier = suffix_multipliers[last]
+        token = token[:-1]
+    try:
+        value = float(token) if token else 1.0
+    except ValueError:
+        return 1.0
+    result = value * multiplier
+    return result if result > 0 else 1.0
+
 
 class AzurePricingServer:
     """Azure Pricing MCP Server implementation."""
@@ -95,6 +140,31 @@ class AzurePricingServer:
         if last_exception:
             raise last_exception
     
+    async def _paginate(
+        self, url: str, params: Optional[Dict[str, Any]], max_items: int
+    ) -> tuple:
+        """Fetch results across pages, following NextPageLink up to max_items.
+
+        The Retail Prices API ignores ``$top`` and returns ~1000 items per page
+        with a ``NextPageLink`` for the next page, so reading a single response
+        silently drops everything beyond the first page. This follows the links
+        until ``max_items`` is collected, no pages remain, or ``MAX_PAGES`` is
+        hit. Returns ``(items, truncated)`` where ``truncated`` is True when more
+        results existed beyond what was returned.
+        """
+        data = await self._make_request(url, params)
+        items: List[Dict[str, Any]] = list(data.get("Items", []) or [])
+        next_link = data.get("NextPageLink")
+        pages = 1
+        while next_link and len(items) < max_items and pages < MAX_PAGES:
+            # NextPageLink is a fully-formed URL including the query string.
+            data = await self._make_request(next_link)
+            items.extend(data.get("Items", []) or [])
+            next_link = data.get("NextPageLink")
+            pages += 1
+        truncated = bool(next_link) and len(items) >= max_items
+        return items[:max_items], truncated
+    
     async def search_azure_prices(
         self,
         service_name: Optional[str] = None,
@@ -105,7 +175,8 @@ class AzurePricingServer:
         currency_code: str = "USD",
         limit: int = 50,
         discount_percentage: Optional[float] = None,
-        validate_sku: bool = True
+        validate_sku: bool = True,
+        arm_sku_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """Search Azure retail prices with various filters, SKU validation, and discount support."""
         
@@ -113,15 +184,17 @@ class AzurePricingServer:
         filter_conditions = []
         
         if service_name:
-            filter_conditions.append(f"serviceName eq '{service_name}'")
+            filter_conditions.append(f"serviceName eq '{_escape_odata_literal(service_name)}'")
         if service_family:
-            filter_conditions.append(f"serviceFamily eq '{service_family}'")
+            filter_conditions.append(f"serviceFamily eq '{_escape_odata_literal(service_family)}'")
         if region:
-            filter_conditions.append(f"armRegionName eq '{region}'")
+            filter_conditions.append(f"armRegionName eq '{_escape_odata_literal(region)}'")
+        if arm_sku_name:
+            filter_conditions.append(f"armSkuName eq '{_escape_odata_literal(arm_sku_name)}'")
         if sku_name:
-            filter_conditions.append(f"contains(skuName, '{sku_name}')")
+            filter_conditions.append(f"contains(skuName, '{_escape_odata_literal(sku_name)}')")
         if price_type:
-            filter_conditions.append(f"priceType eq '{price_type}'")
+            filter_conditions.append(f"priceType eq '{_escape_odata_literal(price_type)}'")
         
         # Construct query parameters
         params = {
@@ -132,19 +205,9 @@ class AzurePricingServer:
         if filter_conditions:
             params["$filter"] = " and ".join(filter_conditions)
         
-        # Limit results
-        if limit < MAX_RESULTS_PER_REQUEST:
-            params["$top"] = str(limit)
-        
-        # Make request
-        data = await self._make_request(AZURE_PRICING_BASE_URL, params)
-        
-        # Process results
-        items = data.get("Items", [])
-        
-        # If we have more results than requested, truncate
-        if len(items) > limit:
-            items = items[:limit]
+        # Fetch results. The API ignores $top and paginates ~1000/page, so follow
+        # NextPageLink up to the requested limit instead of reading one page.
+        items, truncated = await self._paginate(AZURE_PRICING_BASE_URL, params, limit)
         
         # SKU validation and clarification
         validation_info = {}
@@ -164,7 +227,7 @@ class AzurePricingServer:
         result = {
             "items": items,
             "count": len(items) if isinstance(items, list) else 0,
-            "has_more": bool(data.get("NextPageLink")),
+            "has_more": truncated,
             "currency": currency_code,
             "filters_applied": filter_conditions
         }
@@ -246,6 +309,10 @@ class AzurePricingServer:
         """Apply discount percentage to pricing items."""
         if not items:
             return []
+        
+        # Clamp to a sane range so an out-of-range value can never produce
+        # negative prices or inflated "savings".
+        discount_percentage = max(0.0, min(100.0, float(discount_percentage)))
         
         discounted_items = []
         
@@ -489,6 +556,189 @@ class AzurePricingServer:
         
         return result
 
+    async def price_architecture(
+        self,
+        line_items: List[Dict[str, Any]],
+        currency_code: str = "USD",
+    ) -> Dict[str, Any]:
+        """Price a list of architecture line items into a single monthly bill.
+
+        Each line item is looked up against the Retail Prices API, the unit
+        price is resolved, and a unit-aware subtotal is computed in code
+        (``unit_price * quantity / unit_multiplier``). Subtotals are summed
+        deterministically so the agent never has to do the arithmetic.
+
+        Line items that resolve to multiple distinct meters are marked
+        ``ambiguous`` and those that resolve to none are marked ``not_found``;
+        both are excluded from the total and reported in ``warnings`` along with
+        candidate meters so the caller can refine the request.
+        """
+        priced_items: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        monthly_total = 0.0
+
+        for idx, raw in enumerate(line_items):
+            name = raw.get("name") or f"item-{idx + 1}"
+            service_name = raw.get("service_name")
+            sku_name = raw.get("sku_name")
+            arm_sku_name = raw.get("arm_sku_name")
+            region = raw.get("region")
+            price_type = raw.get("price_type", "Consumption")
+            quantity = raw.get("quantity", 0)
+            expected_unit = raw.get("unit")
+            meter_name = raw.get("meter_name")
+            product_name = raw.get("product_name")
+            discount = raw.get("discount_percentage")
+
+            entry: Dict[str, Any] = {
+                "name": name,
+                "service_name": service_name,
+                "sku_name": sku_name,
+                "arm_sku_name": arm_sku_name,
+                "region": region,
+                "price_type": price_type,
+                "quantity": quantity,
+            }
+
+            if not service_name or not (sku_name or arm_sku_name) or not region:
+                entry["status"] = "invalid"
+                entry["error"] = "service_name, region and one of sku_name/arm_sku_name are required"
+                entry["subtotal"] = None
+                warnings.append(f"{name}: missing required field (service_name, region, sku_name|arm_sku_name).")
+                priced_items.append(entry)
+                continue
+
+            search = await self.search_azure_prices(
+                service_name=service_name,
+                sku_name=sku_name,
+                arm_sku_name=arm_sku_name,
+                region=region,
+                price_type=price_type,
+                currency_code=currency_code,
+                limit=MAX_RESULTS_PER_REQUEST,
+                validate_sku=False,
+            )
+            items = search.get("items", []) or []
+
+            if meter_name:
+                items = [i for i in items if i.get("meterName") == meter_name]
+            if product_name:
+                items = [i for i in items if i.get("productName") == product_name]
+            if expected_unit:
+                unit_matches = [i for i in items if i.get("unitOfMeasure") == expected_unit]
+                if unit_matches:
+                    items = unit_matches
+
+            # Group rows into logical meters. Rows that share meterName +
+            # productName + unitOfMeasure but differ in price are pricing tiers
+            # (tierMinimumUnits), not separate meters, so they are collapsed into
+            # one group. Genuinely different meters/products/units stay distinct.
+            groups: Dict[tuple, List[Dict[str, Any]]] = {}
+            group_order: List[tuple] = []
+            for i in items:
+                gkey = (i.get("meterName"), i.get("productName"), i.get("unitOfMeasure"))
+                if gkey not in groups:
+                    groups[gkey] = []
+                    group_order.append(gkey)
+                groups[gkey].append(i)
+
+            if not group_order:
+                entry["status"] = "not_found"
+                entry["subtotal"] = None
+                entry["candidates"] = []
+                warnings.append(
+                    f"{name}: no price found for '{sku_name}' ({service_name}, {region}). "
+                    f"Excluded from total."
+                )
+                priced_items.append(entry)
+                continue
+
+            try:
+                qty = float(quantity)
+            except (TypeError, ValueError):
+                qty = 0.0
+
+            if len(group_order) > 1:
+                entry["status"] = "ambiguous"
+                entry["subtotal"] = None
+                entry["candidates"] = []
+                for gkey in group_order[:8]:
+                    rep = min(groups[gkey], key=lambda r: (r.get("tierMinimumUnits") or 0))
+                    entry["candidates"].append(
+                        {
+                            "meter_name": rep.get("meterName"),
+                            "product_name": rep.get("productName"),
+                            "sku_name": rep.get("skuName"),
+                            "unit_of_measure": rep.get("unitOfMeasure"),
+                            "unit_price": rep.get("retailPrice"),
+                            "tiers": len(groups[gkey]),
+                        }
+                    )
+                warnings.append(
+                    f"{name}: {len(group_order)} distinct meters match; pass 'meter_name', "
+                    f"'product_name' or 'unit' to disambiguate. Excluded from total."
+                )
+                priced_items.append(entry)
+                continue
+
+            # Single logical meter: select the applicable pricing tier for the
+            # requested quantity (the highest tierMinimumUnits that is <= qty).
+            tier_rows = sorted(groups[group_order[0]], key=lambda r: (r.get("tierMinimumUnits") or 0))
+            chosen = tier_rows[0]
+            for row in tier_rows:
+                if (row.get("tierMinimumUnits") or 0) <= qty:
+                    chosen = row
+                else:
+                    break
+
+            unit_price = chosen.get("retailPrice", 0) or 0
+            unit_of_measure = chosen.get("unitOfMeasure", "1")
+            original_unit_price = unit_price
+
+            applied_discount = None
+            if discount is not None and discount > 0:
+                applied_discount = max(0.0, min(100.0, float(discount)))
+                unit_price = unit_price * (1 - applied_discount / 100)
+
+            multiplier = _parse_unit_multiplier(unit_of_measure)
+            subtotal = round(unit_price * qty / multiplier, 4)
+
+            entry.update(
+                {
+                    "status": "ok",
+                    "meter_name": chosen.get("meterName"),
+                    "product_name": chosen.get("productName"),
+                    "unit_price": round(unit_price, 6),
+                    "unit_of_measure": unit_of_measure,
+                    "unit_multiplier": multiplier,
+                    "subtotal": subtotal,
+                }
+            )
+            if applied_discount is not None:
+                entry["original_unit_price"] = round(original_unit_price, 6)
+                entry["discount_percentage"] = applied_discount
+            if len(tier_rows) > 1:
+                entry["tier_applied"] = chosen.get("tierMinimumUnits") or 0
+                entry["tier_count"] = len(tier_rows)
+                entry["note"] = (
+                    "Tiered meter; single applicable tier rate used (not graduated)."
+                )
+
+            monthly_total += subtotal
+            priced_items.append(entry)
+
+        priced_count = sum(1 for e in priced_items if e.get("status") == "ok")
+        return {
+            "currency": currency_code,
+            "line_items": priced_items,
+            "monthly_total": round(monthly_total, 2),
+            "yearly_total": round(monthly_total * 12, 2),
+            "priced_count": priced_count,
+            "total_line_items": len(line_items),
+            "all_priced": priced_count == len(line_items),
+            "warnings": warnings,
+        }
+
     async def discover_skus(
         self,
         service_name: str,
@@ -499,13 +749,13 @@ class AzurePricingServer:
         """Discover available SKUs for a specific Azure service."""
         
         # Build filter conditions
-        filter_conditions = [f"serviceName eq '{service_name}'"]
+        filter_conditions = [f"serviceName eq '{_escape_odata_literal(service_name)}'"]
         
         if region:
-            filter_conditions.append(f"armRegionName eq '{region}'")
+            filter_conditions.append(f"armRegionName eq '{_escape_odata_literal(region)}'")
         
         if price_type:
-            filter_conditions.append(f"priceType eq '{price_type}'")
+            filter_conditions.append(f"priceType eq '{_escape_odata_literal(price_type)}'")
         
         # Construct query parameters
         params = {
@@ -516,16 +766,13 @@ class AzurePricingServer:
         if filter_conditions:
             params["$filter"] = " and ".join(filter_conditions)
         
-        # Limit results
-        if limit < MAX_RESULTS_PER_REQUEST:
-            params["$top"] = str(limit)
-        
-        # Make request
-        data = await self._make_request(AZURE_PRICING_BASE_URL, params)
+        # Fetch across pages (the API paginates ~1000/page) so discovery sees
+        # SKUs beyond the first page. Cap at a few pages to bound latency.
+        fetch_cap = min(max(limit * 20, 3000), MAX_RESULTS_PER_REQUEST * 5)
+        items, truncated = await self._paginate(AZURE_PRICING_BASE_URL, params, fetch_cap)
         
         # Process and deduplicate SKUs
         skus = {}
-        items = data.get("Items", [])
         
         for item in items:
             sku_name = item.get("skuName")
@@ -555,10 +802,17 @@ class AzurePricingServer:
         sku_list = list(skus.values())
         sku_list.sort(key=lambda x: x["sku_name"])
         
+        # Cap the returned SKUs to the requested limit.
+        total_discovered = len(sku_list)
+        if len(sku_list) > limit:
+            sku_list = sku_list[:limit]
+        
         return {
             "service_name": service_name,
             "skus": sku_list,
             "total_skus": len(sku_list),
+            "total_discovered": total_discovered,
+            "has_more": truncated or total_discovered > limit,
             "price_type": price_type,
             "region_filter": region
         }
@@ -1036,6 +1290,85 @@ async def handle_list_tools() -> List[Tool]:
                     }
                 }
             }
+        ),
+        Tool(
+            name="azure_price_architecture",
+            description=(
+                "Price a whole architecture / application in one call. Provide a list of line "
+                "items (one per metered resource) and get back a structured monthly bill with "
+                "per-line subtotals and a deterministically-summed monthly and yearly total. "
+                "Subtotals are computed in code as unit_price * quantity / unit_multiplier, so "
+                "no client-side arithmetic is needed. quantity must be expressed in the meter's "
+                "base unit (e.g. hours for an hourly meter, GB for a per-GB meter). Line items "
+                "matching multiple meters are returned as 'ambiguous' with candidate meters and "
+                "excluded from the total; resolve them by supplying 'meter_name' or 'unit'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency_code": {
+                        "type": "string",
+                        "description": "Currency for the whole bill (default: USD)",
+                        "default": "USD"
+                    },
+                    "line_items": {
+                        "type": "array",
+                        "description": "Resources to price; one entry per metered component.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "Optional label for this line on the bill (e.g. 'web-vm')."
+                                },
+                                "service_name": {
+                                    "type": "string",
+                                    "description": "Azure service name (e.g. 'Virtual Machines', 'Storage')."
+                                },
+                                "sku_name": {
+                                    "type": "string",
+                                                    "description": "SKU name to match (substring match, e.g. 'Standard_D2s_v3' or 'Hot LRS')."
+                                },
+                                                "arm_sku_name": {
+                                                    "type": "string",
+                                                    "description": "Exact ARM SKU name (e.g. 'Standard_D2s_v3'). Use this for VMs and other resources referenced by ARM name; matches the armSkuName field exactly."
+                                                },
+                                "region": {
+                                    "type": "string",
+                                    "description": "Azure region (e.g. 'eastus')."
+                                },
+                                "price_type": {
+                                    "type": "string",
+                                    "description": "Price type (default: 'Consumption').",
+                                    "default": "Consumption"
+                                },
+                                "quantity": {
+                                    "type": "number",
+                                    "description": "Usage in the meter's base unit (e.g. 730 for hours/month, GB stored)."
+                                },
+                                "unit": {
+                                    "type": "string",
+                                    "description": "Optional expected unitOfMeasure to disambiguate meters (e.g. '1 Hour')."
+                                },
+                                "meter_name": {
+                                    "type": "string",
+                                    "description": "Optional exact meterName to disambiguate when several meters match."
+                                },
+                                                "product_name": {
+                                                    "type": "string",
+                                                    "description": "Optional exact productName to disambiguate tiers that share a meterName (e.g. premium vs standard accounts)."
+                                                },
+                                "discount_percentage": {
+                                    "type": "number",
+                                    "description": "Optional discount applied to this line's unit price (0-100)."
+                                }
+                            },
+                            "required": ["service_name", "region", "quantity"]
+                        }
+                    }
+                },
+                "required": ["line_items"]
+            }
         )
     ]
 
@@ -1046,14 +1379,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list:
     try:
         async with pricing_server:
             if name == "azure_price_search":
-                # Always get customer discount and apply it
-                customer_discount = await pricing_server.get_customer_discount()
-                discount_percentage = customer_discount["discount_percentage"]
-                
-                # Add discount to arguments if not already specified
-                if "discount_percentage" not in arguments:
-                    arguments["discount_percentage"] = discount_percentage
-                
+                # Only apply a discount when the caller explicitly requests one.
+                # Previously a hardcoded 10% "customer discount" was applied to
+                # every search, silently returning prices 10% below Azure's
+                # actual retail prices. Pricing data must reflect real prices by
+                # default; discounts are opt-in via the discount_percentage arg.
                 result = await pricing_server.search_azure_prices(**arguments)
                 
                 # Format the response
@@ -1387,6 +1717,47 @@ Applicable Services: {result['applicable_services']}
                     )
                 ]
             
+            elif name == "azure_price_architecture":
+                result = await pricing_server.price_architecture(**arguments)
+
+                currency = result["currency"]
+                lines = [
+                    f"Azure architecture estimate ({currency}):",
+                    f"  Monthly total: {result['monthly_total']} {currency}",
+                    f"  Yearly total:  {result['yearly_total']} {currency}",
+                    f"  Priced {result['priced_count']}/{result['total_line_items']} line items.",
+                    "",
+                ]
+                for item in result["line_items"]:
+                    status = item.get("status")
+                    if status == "ok":
+                        lines.append(
+                            f"  ✅ {item['name']}: {item['subtotal']} {currency} "
+                            f"({item['quantity']} x {item['unit_price']} per {item['unit_of_measure']}) "
+                            f"[{item.get('meter_name')}]"
+                        )
+                    else:
+                        lines.append(
+                            f"  ⚠️ {item['name']}: {status} — not included in total"
+                        )
+
+                if result["warnings"]:
+                    lines.append("")
+                    lines.append("Warnings:")
+                    for w in result["warnings"]:
+                        lines.append(f"  • {w}")
+
+                lines.append("")
+                lines.append("Structured result (JSON):")
+                lines.append(json.dumps(result, indent=2))
+
+                return [
+                    TextContent(
+                        type="text",
+                        text="\n".join(lines)
+                    )
+                ]
+
             else:
                 return [
                     TextContent(
